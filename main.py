@@ -1,5 +1,5 @@
 def main():
-    print("Hello from rag-papeer-project!")
+    print("Hello from Atelier!")
 
 
 if __name__ == "__main__":

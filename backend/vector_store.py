@@ -37,7 +37,7 @@ qdrant_client = QdrantClient(
 # ── Collection ───────────────────────────────────────────────────────────────
 
 def get_collection_name(session_id: str) -> str:
-    return f"papeer_{session_id.replace('-', '_')}"
+    return f"atelier_{session_id.replace('-', '_')}"
 
 
 def get_vectorstore(session_id: str) -> QdrantVectorStore:

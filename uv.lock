@@ -2820,7 +2820,7 @@ wheels = [
 ]
 
 [[package]]
-name = "rag-papeer-project"
+name = "atelier"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
