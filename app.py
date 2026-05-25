@@ -13,6 +13,7 @@ from backend.btw_handler import handle_btw
 from backend.llm_factory import get_llm, llm_provider_label
 from backend.paper_loader import load_arxiv, load_document, load_webpage
 from backend.rag_graph import build_graph
+from backend.transcript import store as transcript_store
 from backend.vector_store import add_paper, list_papers
 
 st.set_page_config(page_title="Atelier", page_icon="📚", layout="centered")
@@ -467,6 +468,16 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
         }
         config = {"configurable": {"thread_id": active_sid}}
 
+        next_turn = st.session_state.turns[active_sid] + 1
+        transcript_store.append(
+            active_sid,
+            kind="router",
+            summary=f"turn {next_turn} started — '{prompt[:80]}'",
+            node="user",
+            turn=next_turn,
+            data={"user_message": prompt},
+        )
+
         response_text = ""
         error_text = ""
         state_snapshot: dict = {}
@@ -491,6 +502,9 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
 
                 final_values = graph.get_state(config).values
                 state_snapshot = _serialize_state(final_values)
+                retrieval_context = [
+                    d.page_content for d in (final_values.get("retrieved_docs") or [])
+                ]
 
                 # Success: bump turn counter and clear any previous unhealthy state.
                 st.session_state.turns[active_sid] += 1
@@ -518,6 +532,7 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
                 st.error(error_text)
                 state_snapshot = {"error": str(e), "error_type": type(e).__name__}
                 current_turn = demo_guard.turns_used(active_sid)
+                retrieval_context = []
 
         st.session_state.chats[active_sid].append(
             {
@@ -525,6 +540,8 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
                 "content": response_text or error_text,
                 "graph_state": state_snapshot,
                 "turn": current_turn,
+                "user_message": prompt,
+                "retrieval_context": retrieval_context,
             }
         )
 

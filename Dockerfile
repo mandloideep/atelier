@@ -17,6 +17,8 @@ COPY app.py .
 COPY evaluate.py .
 COPY main.py .
 COPY goldens.json .
+COPY eval_results.json .
+COPY pages/ pages/
 
 EXPOSE 8501
 

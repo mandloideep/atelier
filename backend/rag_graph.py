@@ -19,6 +19,7 @@ from tavily import TavilyClient
 
 from backend.llm_factory import get_llm
 from backend.models import ClaimVerificationResult, RelevancyDecision, RouterDecision
+from backend.transcript import store as transcript_store
 from backend.vector_store import search as vs_search
 
 load_dotenv()
@@ -74,6 +75,13 @@ router_chain = ROUTER_PROMPT | llm.with_structured_output(RouterDecision)
 def router_node(state: RAGState) -> dict:
     query = state["messages"][-1].content
     decision: RouterDecision = router_chain.invoke({"query": query})
+    transcript_store.append(
+        state.get("session_id", ""),
+        kind="router",
+        summary=f"Routed to '{decision.route}'",
+        node="router",
+        data={"query": query, "route": decision.route},
+    )
     return {"route": decision.route}
 
 
@@ -101,6 +109,19 @@ def retrieve_from_vectorstore(
 ) -> list:
     """Search the uploaded research paper vector store for relevant passages."""
     docs = vs_search(query=query, session_id=session_id, k=k)
+    transcript_store.append(
+        session_id,
+        kind="tool_result",
+        summary=f"vectorstore: {len(docs)} chunk(s) for '{query[:60]}'",
+        node="retrieval",
+        data={
+            "tool": "retrieve_from_vectorstore",
+            "query": query,
+            "k": k,
+            "result_count": len(docs),
+            "previews": [d.page_content[:200] for d in docs[:3]],
+        },
+    )
     if not docs:
         return [ToolMessage(content="No relevant documents found in the vector store.", tool_call_id=tool_call_id)]
     summary = f"Retrieved {len(docs)} chunk(s) from the vector store."
@@ -114,20 +135,34 @@ def retrieve_from_vectorstore(
 def web_search(
     optimized_query: str,
     max_results: int,
+    session_id: Annotated[str, InjectedState("session_id")],
     current_docs: Annotated[list, InjectedState("retrieved_docs")],
     tool_call_id: Annotated[str, InjectedToolCallId],
 ) -> list:
     """Search the web for current or supplementary information using Tavily."""
     client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
     results = client.search(optimized_query, max_results=max_results)
-    if not results.get("results"):
+    hits = results.get("results", [])
+    transcript_store.append(
+        session_id,
+        kind="tool_result",
+        summary=f"web_search: {len(hits)} result(s) for '{optimized_query[:60]}'",
+        node="retrieval",
+        data={
+            "tool": "web_search",
+            "query": optimized_query,
+            "max_results": max_results,
+            "urls": [r.get("url") for r in hits],
+        },
+    )
+    if not hits:
         return [ToolMessage(content="No web results found.", tool_call_id=tool_call_id)]
     web_docs = [
         Document(
             page_content=r["content"],
             metadata={"url": r["url"], "title": r.get("title", "Web Result")},
         )
-        for r in results["results"]
+        for r in hits
     ]
     summary = f"Found {len(web_docs)} web result(s) for: {optimized_query}"
     return [
@@ -195,9 +230,36 @@ def agent_node(state: RAGState) -> dict:
     messages = [{"role": "system", "content": RETRIEVE_SYSTEM}] + state["messages"]
     response = lm.invoke(messages)
     updates: dict = {"messages": [response]}
-    if getattr(response, "tool_calls", None):
+    tool_calls = getattr(response, "tool_calls", None) or []
+    if tool_calls:
         updates["retrieval_attempts"] = current_attempts + 1
+        for tc in tool_calls:
+            transcript_store.append(
+                state.get("session_id", ""),
+                kind="tool_call",
+                summary=f"agent calls {tc.get('name')}({_arg_preview(tc.get('args', {}))})",
+                node="agent_node",
+                data={"name": tc.get("name"), "args": tc.get("args")},
+            )
+    else:
+        transcript_store.append(
+            state.get("session_id", ""),
+            kind="relevancy",
+            summary="agent emitted no tool calls (attempts cap reached or done)",
+            node="agent_node",
+            data={"attempts": current_attempts},
+        )
     return updates
+
+
+def _arg_preview(args: dict) -> str:
+    if not args:
+        return ""
+    parts = []
+    for k, v in args.items():
+        sv = str(v)
+        parts.append(f"{k}={sv[:40]}")
+    return ", ".join(parts)
 
 
 def relevancy_check_node(state: RAGState) -> dict:
@@ -205,6 +267,12 @@ def relevancy_check_node(state: RAGState) -> dict:
     docs = state.get("retrieved_docs") or []
     doc_snippets = "\n\n---\n\n".join(doc.page_content[:300] for doc in docs[:3])
     if not doc_snippets:
+        transcript_store.append(
+            state.get("session_id", ""),
+            kind="relevancy",
+            summary="no docs to judge — marking irrelevant",
+            node="relevancy_check",
+        )
         return {"is_relevant": False}
     prompt = (
         f"Question: {query}\n\nRetrieved chunks:\n{doc_snippets}\n\n"
@@ -214,6 +282,13 @@ def relevancy_check_node(state: RAGState) -> dict:
         {"role": "system", "content": RELEVANCY_CHECK_SYSTEM},
         {"role": "user", "content": prompt},
     ])
+    transcript_store.append(
+        state.get("session_id", ""),
+        kind="relevancy",
+        summary=f"chunks judged {'relevant' if decision.is_relevant else 'irrelevant'} ({len(docs)} doc(s))",
+        node="relevancy_check",
+        data={"is_relevant": decision.is_relevant, "doc_count": len(docs)},
+    )
     return {"is_relevant": decision.is_relevant}
 
 
@@ -225,6 +300,13 @@ def query_rewrite_node(state: RAGState) -> dict:
         {"role": "user", "content": f"Original query: {original_query}\n\nWrite an improved search query."},
     ])
     rewritten = response.content.strip()
+    transcript_store.append(
+        state.get("session_id", ""),
+        kind="rewrite",
+        summary=f"query rewritten → '{rewritten[:80]}'",
+        node="query_rewrite",
+        data={"original": original_query, "rewritten": rewritten, "attempt": rewrite_count + 1},
+    )
     return {
         "messages": [HumanMessage(content=rewritten)],
         "query": rewritten,
@@ -296,6 +378,17 @@ def verify_claim_node(state: RAGState) -> dict:
     ])
 
     papers_dicts = [p.model_dump() for p in result.superseding_papers[:3]]
+    transcript_store.append(
+        state.get("session_id", ""),
+        kind="verdict",
+        summary=f"claim verdict: {result.verdict_summary[:100]}",
+        node="verify_claim",
+        data={
+            "verdict": result.verdict_summary,
+            "superseding_count": len(papers_dicts),
+            "papers": papers_dicts,
+        },
+    )
     return {
         "claim_verdict": result.verdict_summary,
         "claim_source": papers_dicts[0]["url"] if papers_dicts else None,
@@ -353,6 +446,13 @@ def generate_answer_node(state: RAGState) -> dict:
         prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
         answer = llm.invoke([{"role": "user", "content": prompt}]).content
 
+    transcript_store.append(
+        state.get("session_id", ""),
+        kind="answer",
+        summary=f"final answer ({route}, {len(answer)} chars)",
+        node="generate_answer",
+        data={"route": route, "answer": answer},
+    )
     return {"answer": answer, "messages": [AIMessage(content=answer)]}
 
 
