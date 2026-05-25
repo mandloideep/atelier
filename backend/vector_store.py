@@ -4,25 +4,31 @@ from dotenv import load_dotenv
 from langchain_classic.embeddings import CacheBackedEmbeddings
 from langchain_classic.storage import LocalFileStore
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
+
+from backend.llm_factory import get_embed_dim, get_embeddings
 
 load_dotenv()
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-EMBEDDING_DIM = 1536  # text-embedding-3-small
+EMBEDDING_DIM = get_embed_dim()
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 
-base_embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+base_embeddings = get_embeddings()
+# Namespace the cache so switching providers/models doesn't return stale vectors.
+_cache_namespace = (
+    getattr(base_embeddings, "model", None)
+    or type(base_embeddings).__name__
+)
 embedding_file_store = LocalFileStore("./embedding_cache/")
 embeddings = CacheBackedEmbeddings.from_bytes_store(
     base_embeddings,
     embedding_file_store,
-    namespace=base_embeddings.model,
+    namespace=str(_cache_namespace),
     query_embedding_cache=True,
     key_encoder="blake2b",
 )

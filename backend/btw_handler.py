@@ -3,14 +3,14 @@ from typing import Generator
 
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_openai import ChatOpenAI
 from tavily import TavilyClient
 
+from backend.llm_factory import get_llm
 from backend.models import BtwRouteDecision
 
 load_dotenv()
 
-llm = ChatOpenAI(model="gpt-5-mini")
+llm = get_llm()
 
 
 def handle_btw(query: str) -> Generator[str, None, None]:
