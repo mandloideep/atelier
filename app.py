@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import uuid
 from datetime import datetime
@@ -6,9 +7,10 @@ from pathlib import Path
 
 import streamlit as st
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
 
+from backend import demo_guard
 from backend.btw_handler import handle_btw
+from backend.llm_factory import get_llm, llm_provider_label
 from backend.paper_loader import load_arxiv, load_document, load_webpage
 from backend.rag_graph import build_graph
 from backend.vector_store import add_paper, list_papers
@@ -21,8 +23,9 @@ def get_graph():
     return build_graph()
 
 
-SESSIONS_FILE = Path("sessions.json")
-_rename_llm = ChatOpenAI(model="gpt-5-mini")
+SESSIONS_FILE = Path(os.getenv("ATELIER_SESSIONS_FILE", "sessions.json"))
+SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+_rename_llm = get_llm()
 
 
 def load_sessions() -> dict:
@@ -134,6 +137,39 @@ def switch_session(session_id: str) -> None:
         st.session_state.turns[session_id] = turn_count
 
 
+def maybe_preload_demo_docs(session_id: str) -> None:
+    """Ingest pre-bundled demo PDFs into a fresh session so reviewers land
+    on a working sandbox. No-op unless DEMO_MODE=1 and DEMO_PRELOAD_DIR is set."""
+    if not demo_guard.is_demo_mode():
+        return
+    preload_dir = os.getenv("DEMO_PRELOAD_DIR", "").strip()
+    if not preload_dir:
+        return
+    preloaded = st.session_state.setdefault("preloaded_sids", set())
+    if session_id in preloaded:
+        return
+    preloaded.add(session_id)
+    path = Path(preload_dir)
+    if not path.is_dir():
+        return
+    try:
+        existing = set(list_papers(session_id))
+    except Exception:
+        existing = set()
+    for pdf_path in sorted(path.glob("*.pdf")):
+        title = pdf_path.stem
+        if title in existing:
+            continue
+        try:
+            docs = load_document(str(pdf_path))
+            for doc in docs:
+                doc.metadata["title"] = title
+            add_paper(docs, session_id)
+        except Exception:
+            # Preload is best-effort; never block the UI.
+            pass
+
+
 graph = get_graph()
 
 # ── Bootstrap ──────────────────────────────────────────────────────────────────
@@ -155,9 +191,35 @@ if "active_session_id" not in st.session_state:
         st.session_state.active_session_id = sid
 
 active_sid = st.session_state.active_session_id
+maybe_preload_demo_docs(active_sid)
+
+
+def _render_status_badge(session_id: str) -> None:
+    if not demo_guard.is_demo_mode():
+        return
+    status = demo_guard.llm_status()
+    used = demo_guard.turns_used(session_id)
+    cap = demo_guard.session_message_cap()
+    ip_used = demo_guard.ip_count()
+    ip_cap = demo_guard.ip_cap()
+    cta = demo_guard.cta_message()
+    if status == "quota_exhausted":
+        st.warning(f"🟡 Daily free quota exhausted — try again tomorrow or {cta}.")
+    elif status == "unhealthy":
+        st.error(f"🔴 API unavailable — please {cta}.")
+    elif ip_used >= ip_cap:
+        st.warning(f"🟡 Daily limit reached for your network — try again tomorrow or {cta}.")
+    elif used >= cap:
+        st.warning(f"⚠️ Session limit reached — {cta}.")
+    else:
+        st.success(
+            f"🟢 API healthy · session {used}/{cap} · today {ip_used}/{ip_cap}"
+        )
+
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    _render_status_badge(active_sid)
     if st.button("+ New Chat", use_container_width=True):
         new_sid = create_session()
         st.session_state.active_session_id = new_sid
@@ -297,6 +359,16 @@ st.markdown(
     "🌐 **Search the web** for the latest findings\n\n"
     "> Upload documents in the sidebar and start chatting below."
 )
+
+if demo_guard.is_demo_mode():
+    cap = demo_guard.session_message_cap()
+    email = demo_guard.contact_email()
+    contact = f" — email **{email}** for full access" if email else ""
+    st.info(
+        f"**Demo mode** — running on **{llm_provider_label()}** (free tier). "
+        f"Up to **{cap} messages per session**{contact}."
+    )
+
 st.divider()
 
 # ── Chat display ───────────────────────────────────────────────────────────────
@@ -341,8 +413,40 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
         with st.chat_message("user"):
             st.markdown(prompt)
         st.session_state.chats[active_sid].append({"role": "user", "content": prompt})
-        st.session_state.turns[active_sid] += 1
-        current_turn = st.session_state.turns[active_sid]
+
+        # ── Demo-mode gates: refuse to invoke the graph if we're over cap or the LLM is down.
+        blocked_reason: str | None = None
+        if demo_guard.over_ip_cap():
+            blocked_reason = (
+                f"You've reached today's {demo_guard.ip_cap()}-message limit for your network. "
+                f"Please try again tomorrow or {demo_guard.cta_message()}."
+            )
+        elif demo_guard.over_cap(active_sid):
+            blocked_reason = (
+                f"You've reached the {demo_guard.session_message_cap()}-message demo limit "
+                f"for this session. Please {demo_guard.cta_message()}."
+            )
+        elif demo_guard.llm_status() == "quota_exhausted":
+            blocked_reason = (
+                "The daily free quota for the demo LLM is exhausted. "
+                f"Please try again tomorrow or {demo_guard.cta_message()}."
+            )
+        elif demo_guard.llm_status() == "unhealthy":
+            blocked_reason = (
+                "The model is currently unavailable. "
+                f"Please {demo_guard.cta_message()}."
+            )
+
+        if blocked_reason is not None:
+            with st.chat_message("assistant"):
+                st.warning(blocked_reason)
+            st.session_state.chats[active_sid].append({
+                "role": "assistant",
+                "content": blocked_reason,
+                "graph_state": {"blocked": True},
+                "turn": st.session_state.turns[active_sid],
+            })
+            st.stop()
 
         if is_first_message:
             maybe_rename_session(active_sid, prompt)
@@ -363,35 +467,62 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
         }
         config = {"configurable": {"thread_id": active_sid}}
 
+        response_text = ""
+        error_text = ""
+        state_snapshot: dict = {}
+
         with st.chat_message("assistant"):
             placeholder = st.empty()
-            response_text = ""
+            try:
+                for chunk, metadata in graph.stream(input_state, config, stream_mode="messages"):
+                    if (
+                        metadata.get("langgraph_node") == "generate_answer"
+                        and hasattr(chunk, "content")
+                        and chunk.content
+                    ):
+                        response_text += chunk.content
+                        placeholder.markdown(response_text + "▌")
 
-            for chunk, metadata in graph.stream(input_state, config, stream_mode="messages"):
-                if (
-                    metadata.get("langgraph_node") == "generate_answer"
-                    and hasattr(chunk, "content")
-                    and chunk.content
-                ):
-                    response_text += chunk.content
-                    placeholder.markdown(response_text + "▌")
+                if not response_text:
+                    final_values = graph.get_state(config).values
+                    response_text = final_values.get("answer") or "No response generated."
 
-            if not response_text:
+                placeholder.markdown(response_text)
+
                 final_values = graph.get_state(config).values
-                response_text = final_values.get("answer") or "No response generated."
+                state_snapshot = _serialize_state(final_values)
 
-            placeholder.markdown(response_text)
+                # Success: bump turn counter and clear any previous unhealthy state.
+                st.session_state.turns[active_sid] += 1
+                current_turn = st.session_state.turns[active_sid]
+                demo_guard.mark_llm_healthy()
+                demo_guard.record_successful_turn()
 
-            final_values = graph.get_state(config).values
-            state_snapshot = _serialize_state(final_values)
-
-            with st.expander(f"📊 Graph state · turn {current_turn}", expanded=False):
-                st.json(state_snapshot)
+                with st.expander(f"📊 Graph state · turn {current_turn}", expanded=False):
+                    st.json(state_snapshot)
+            except Exception as e:
+                status = demo_guard.classify_exception(e)
+                if status == "quota_exhausted":
+                    demo_guard.mark_quota_exhausted(str(e))
+                    error_text = (
+                        "Daily free quota for the demo LLM is exhausted. "
+                        f"Please try again tomorrow or {demo_guard.cta_message()}."
+                    )
+                else:
+                    demo_guard.mark_llm_unhealthy(str(e))
+                    error_text = (
+                        "The model is currently unavailable. "
+                        f"Please {demo_guard.cta_message()}."
+                    )
+                placeholder.empty()
+                st.error(error_text)
+                state_snapshot = {"error": str(e), "error_type": type(e).__name__}
+                current_turn = demo_guard.turns_used(active_sid)
 
         st.session_state.chats[active_sid].append(
             {
                 "role": "assistant",
-                "content": response_text,
+                "content": response_text or error_text,
                 "graph_state": state_snapshot,
                 "turn": current_turn,
             }
