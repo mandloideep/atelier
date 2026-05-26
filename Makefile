@@ -3,7 +3,7 @@
 # Run `make help` for a full list. Targets are grouped: deps, run, eval,
 # cleanup, docker, qdrant ops.
 
-.PHONY: help install run eval clean fresh docker-build docker-up docker-down docker-logs docker-shell qdrant-drop format lint check
+.PHONY: help install run eval clean fresh docker-build docker-up docker-down docker-logs docker-shell qdrant-drop format lint check ghcr-build
 
 help:  ## List available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -47,6 +47,14 @@ docker-logs:  ## Tail container logs
 
 docker-shell:  ## Exec a shell inside the running container
 	docker compose exec atelier bash
+
+# ── GHCR (manual production image build) ─────────────────────────────────────
+
+ghcr-build:  ## Trigger the manual GitHub Actions build → pushes to GHCR (then click Deploy in Dokploy)
+	gh workflow run build.yml
+	@echo "Triggered. Watching…"
+	@sleep 3
+	gh run watch
 
 # ── Qdrant ops ────────────────────────────────────────────────────────────────
 

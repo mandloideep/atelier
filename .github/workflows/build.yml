@@ -1,9 +1,15 @@
 name: Build and push image
 
+# Manual-only. Push to main does NOT trigger this — go to Actions tab →
+# "Build and push image" → "Run workflow" to trigger from the UI, or run
+# `gh workflow run build.yml` from your laptop.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag to apply on top of `latest` and `sha-<short>` (optional)"
+        required: false
+        default: ""
 
 jobs:
   build-push:
@@ -31,6 +37,7 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha,prefix=sha-
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -41,3 +48,14 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo ""
+            echo "Next: open Dokploy → atelier app → **Deploy**"
+          } >> "$GITHUB_STEP_SUMMARY"
