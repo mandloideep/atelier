@@ -1,0 +1,15 @@
+services:
+  atelier:
+    build: .
+    image: atelier:local
+    container_name: atelier
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./.data:/app/data
+    # Container reads paths from the ENV defaults baked in the Dockerfile,
+    # so .env doesn't need to override ATELIER_SESSIONS_FILE / CHECKPOINTS_DB /
+    # EMBEDDING_CACHE_DIR. Override here if you want to point them somewhere
+    # else (e.g. for dev with a sidecar service).

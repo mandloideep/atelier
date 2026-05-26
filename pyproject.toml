@@ -3,7 +3,7 @@ name = "atelier"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = [
     "arxiv>=3.0.0",
     "beautifulsoup4>=4.14.3",
@@ -20,6 +20,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=3.0.3",
     "langsmith>=0.8.3",
     "lxml>=6.1.0",
+    "psutil>=7.2.2",
     "pydantic>=2.13.4",
     "pymupdf>=1.27.2.3",
     "pypdf>=6.10.2",
@@ -27,4 +28,21 @@ dependencies = [
     "qdrant-client>=1.17.1",
     "streamlit>=1.57.0",
     "tavily-python>=0.7.24",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.14",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = [".venv", ".data", "artifacts", "documents", ".deepeval"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",   # line length — formatter handles long lines
+    "E402",   # imports below load_dotenv() are intentional
 ]

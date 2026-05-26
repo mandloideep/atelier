@@ -7,9 +7,13 @@ in-memory only — see `backend/transcript.py` for retention/eviction policy.
 
 import streamlit as st
 
+from backend import demo_guard
 from backend.transcript import store as transcript_store
 
 st.set_page_config(page_title="Transcript · Atelier", page_icon="🪧", layout="wide")
+
+if demo_guard.is_offline():
+    st.error(demo_guard.offline_message())
 
 st.title("🪧 Transcript")
 st.caption(
@@ -19,26 +23,59 @@ st.caption(
 )
 
 active_sid = st.session_state.get("active_session_id")
-if not active_sid:
-    st.info("No active session. Send a message on the main page first.")
+sessions_meta = st.session_state.get("sessions_meta", {})
+if not sessions_meta:
+    st.info("No sessions yet. Start a chat on the main page.")
     st.stop()
 
-session_meta = st.session_state.get("sessions_meta", {}).get(active_sid, {})
-session_name = session_meta.get("name", active_sid[:8])
+# Sort sessions newest-first for the picker
+sorted_sids = sorted(
+    sessions_meta.keys(),
+    key=lambda s: sessions_meta[s].get("created_at", ""),
+    reverse=True,
+)
 
+
+def _label(sid: str) -> str:
+    meta = sessions_meta.get(sid, {})
+    name = meta.get("name", sid[:8])
+    marker = " (active)" if sid == active_sid else ""
+    has = "🪧" if transcript_store.get(sid) else "·"
+    return f"{has} {name}{marker}"
+
+
+default_idx = sorted_sids.index(active_sid) if active_sid in sorted_sids else 0
 col1, col2 = st.columns([4, 1])
-col1.markdown(f"**Session:** _{session_name}_  &nbsp;·&nbsp;  `{active_sid[:8]}…`")
+picked_sid = col1.selectbox(
+    "Session",
+    options=sorted_sids,
+    index=default_idx,
+    format_func=_label,
+    label_visibility="collapsed",
+)
 if col2.button("🧹 Clear transcript", use_container_width=True):
-    transcript_store.clear(active_sid)
+    transcript_store.clear(picked_sid)
     st.rerun()
 
-events = transcript_store.get(active_sid)
+st.caption(
+    f"`{picked_sid[:8]}…` — 🪧 marks sessions with in-memory events. "
+    "Sessions created in a previous container run or evicted (LRU/TTL) won't have one."
+)
+
+events = transcript_store.get(picked_sid)
 
 if not events:
-    st.info(
-        "No events recorded for this session yet. Send a chat message — "
-        "events appear here as the graph runs."
-    )
+    if picked_sid == active_sid:
+        st.info(
+            "No events recorded for this session yet. Send a chat message — "
+            "events appear here as the graph runs."
+        )
+    else:
+        st.info(
+            "No transcript in memory for this session. "
+            "Transcripts are in-process only — this one was probably created in a previous run "
+            "or evicted. Switch back to the active session, or chat in this one to start a new transcript."
+        )
 else:
     # Group events into turns. A new turn starts at every kind="router" event with
     # node="user" (the marker we emit in app.py). Falls back to one big group.
@@ -71,7 +108,11 @@ else:
     }
 
     for i, turn_events in enumerate(turns, 1):
-        marker = turn_events[0] if turn_events[0]["kind"] == "router" and turn_events[0].get("node") == "user" else None
+        marker = (
+            turn_events[0]
+            if turn_events[0]["kind"] == "router" and turn_events[0].get("node") == "user"
+            else None
+        )
         header = f"Turn {i}"
         if marker and marker.get("data", {}).get("user_message"):
             header += f" — {marker['data']['user_message'][:80]}"

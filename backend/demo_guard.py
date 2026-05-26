@@ -58,9 +58,50 @@ def is_demo_mode() -> bool:
     return os.getenv("DEMO_MODE", "0") == "1"
 
 
+def is_offline() -> bool:
+    """Master kill switch. When true, all AI features are gated off but
+    read-only browsing (history, transcript, evals baseline) still works."""
+    return os.getenv("APP_OFFLINE", "0") == "1"
+
+
+def offline_message() -> str:
+    email = contact_email()
+    if email:
+        return (
+            f"🚫 **AI features are currently disabled by the maintainer.** "
+            f"You can still browse past sessions, the transcript, and the evals baseline. "
+            f"Email **{email}** to request access."
+        )
+    return (
+        "🚫 **AI features are currently disabled by the maintainer.** "
+        "You can still browse past sessions, the transcript, and the evals baseline."
+    )
+
+
 def session_message_cap() -> int:
     try:
         return int(os.getenv("SESSION_MESSAGE_CAP", "5"))
+    except ValueError:
+        return 5
+
+
+def max_upload_mb() -> int:
+    try:
+        return int(os.getenv("MAX_UPLOAD_MB", "10"))
+    except ValueError:
+        return 10
+
+
+def max_chunks_per_doc() -> int:
+    try:
+        return int(os.getenv("MAX_CHUNKS_PER_DOC", "200"))
+    except ValueError:
+        return 200
+
+
+def max_docs_per_session() -> int:
+    try:
+        return int(os.getenv("MAX_DOCS_PER_SESSION", "5"))
     except ValueError:
         return 5
 

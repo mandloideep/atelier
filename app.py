@@ -10,7 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from backend import demo_guard
 from backend.btw_handler import handle_btw
-from backend.llm_factory import get_llm, llm_provider_label
+from backend.llm_factory import content_to_text, get_llm, llm_provider_label
 from backend.paper_loader import load_arxiv, load_document, load_webpage
 from backend.rag_graph import build_graph
 from backend.transcript import store as transcript_store
@@ -24,7 +24,7 @@ def get_graph():
     return build_graph()
 
 
-SESSIONS_FILE = Path(os.getenv("ATELIER_SESSIONS_FILE", "sessions.json"))
+SESSIONS_FILE = Path(os.getenv("ATELIER_SESSIONS_FILE", ".data/state/sessions.json"))
 SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
 _rename_llm = get_llm()
 
@@ -32,7 +32,7 @@ _rename_llm = get_llm()
 def load_sessions() -> dict:
     try:
         return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError, json.JSONDecodeError:
         return {}
 
 
@@ -48,18 +48,13 @@ def _serialize_state(values: dict) -> dict:
                 {
                     "type": type(m).__name__,
                     "content": (
-                        m.content[:300]
-                        if isinstance(m.content, str)
-                        else repr(m.content)[:300]
+                        m.content[:300] if isinstance(m.content, str) else repr(m.content)[:300]
                     ),
                 }
                 for m in (v or [])
             ]
         elif k == "retrieved_docs":
-            out[k] = [
-                {"content": d.page_content[:300], "metadata": d.metadata}
-                for d in (v or [])
-            ]
+            out[k] = [{"content": d.page_content[:300], "metadata": d.metadata} for d in (v or [])]
         else:
             out[k] = v
     return out
@@ -123,7 +118,9 @@ def load_session_chats(session_id: str) -> list[dict]:
                 chats.append({"role": "user", "content": content})
             elif type_name in ("AIMessage", "AIMessageChunk"):
                 turn += 1
-                chats.append({"role": "assistant", "content": content, "turn": turn, "graph_state": {}})
+                chats.append(
+                    {"role": "assistant", "content": content, "turn": turn, "graph_state": {}}
+                )
         return chats
     except Exception:
         return []
@@ -192,7 +189,30 @@ if "active_session_id" not in st.session_state:
         st.session_state.active_session_id = sid
 
 active_sid = st.session_state.active_session_id
-maybe_preload_demo_docs(active_sid)
+OFFLINE = demo_guard.is_offline()
+if not OFFLINE:
+    maybe_preload_demo_docs(active_sid)
+
+
+def _enforce_ingest_caps(new_chunk_count: int) -> str | None:
+    """Return an error message if the new doc would violate any ingest cap, else None."""
+    max_chunks = demo_guard.max_chunks_per_doc()
+    if new_chunk_count > max_chunks:
+        return (
+            f"Document produced {new_chunk_count} chunks but the per-document limit is {max_chunks}. "
+            f"Try a shorter file."
+        )
+    try:
+        existing = len(list_papers(active_sid) or [])
+    except Exception:
+        existing = 0
+    max_docs = demo_guard.max_docs_per_session()
+    if existing >= max_docs:
+        return (
+            f"This session already has {existing} document(s) — the per-session limit is {max_docs}. "
+            f"Start a new chat to add more."
+        )
+    return None
 
 
 def _render_status_badge(session_id: str) -> None:
@@ -213,15 +233,15 @@ def _render_status_badge(session_id: str) -> None:
     elif used >= cap:
         st.warning(f"⚠️ Session limit reached — {cta}.")
     else:
-        st.success(
-            f"🟢 API healthy · session {used}/{cap} · today {ip_used}/{ip_cap}"
-        )
+        st.success(f"🟢 API healthy · session {used}/{cap} · today {ip_used}/{ip_cap}")
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
+    if OFFLINE:
+        st.error(demo_guard.offline_message())
     _render_status_badge(active_sid)
-    if st.button("+ New Chat", use_container_width=True):
+    if st.button("+ New Chat", use_container_width=True, disabled=OFFLINE):
         new_sid = create_session()
         st.session_state.active_session_id = new_sid
         active_sid = new_sid
@@ -254,21 +274,34 @@ with st.sidebar:
     # ── Section 1: File upload ─────────────────────────────────────────────────
     st.markdown("**Upload Files**")
     uploaded_files = st.file_uploader(
-        "PDF, TXT, or Markdown",
+        f"PDF, TXT, or Markdown (max {demo_guard.max_upload_mb()} MB each)",
         type=["pdf", "txt", "md", "markdown"],
         accept_multiple_files=True,
         key=f"uploader_{active_sid}",
         label_visibility="collapsed",
+        disabled=OFFLINE,
     )
-    if st.button("Add Files", use_container_width=True, key="btn_add_files"):
+    if st.button(
+        "Add Files",
+        use_container_width=True,
+        key="btn_add_files",
+        disabled=OFFLINE,
+    ):
         if uploaded_files:
             processed_key = f"processed_files_{active_sid}"
             if processed_key not in st.session_state:
                 st.session_state[processed_key] = set()
+            max_bytes = demo_guard.max_upload_mb() * 1024 * 1024
             with st.spinner("Processing files…"):
                 for f in uploaded_files:
                     if f.name in st.session_state[processed_key]:
                         st.info(f"Already loaded: {f.name}")
+                        continue
+                    if getattr(f, "size", 0) > max_bytes:
+                        st.error(
+                            f"Rejected: {f.name} — {f.size / (1024 * 1024):.1f} MB exceeds the "
+                            f"{demo_guard.max_upload_mb()} MB limit."
+                        )
                         continue
                     suffix = Path(f.name).suffix
                     tmp_path = None
@@ -277,6 +310,10 @@ with st.sidebar:
                             tmp.write(f.read())
                             tmp_path = tmp.name
                         docs = load_document(tmp_path)
+                        cap_err = _enforce_ingest_caps(len(docs))
+                        if cap_err:
+                            st.error(f"Rejected: {f.name} — {cap_err}")
+                            continue
                         for doc in docs:
                             doc.metadata["title"] = Path(f.name).stem
                         add_paper(docs, active_sid)
@@ -300,13 +337,22 @@ with st.sidebar:
         label_visibility="collapsed",
         placeholder="https://example.com/paper",
     )
-    if st.button("Load URLs", use_container_width=True, key="btn_load_urls"):
+    if st.button(
+        "Load URLs",
+        use_container_width=True,
+        key="btn_load_urls",
+        disabled=OFFLINE,
+    ):
         urls = [u.strip() for u in url_input.splitlines() if u.strip()]
         if urls:
             with st.spinner("Loading web pages…"):
                 for url in urls:
                     try:
                         docs = load_webpage(url)
+                        cap_err = _enforce_ingest_caps(len(docs))
+                        if cap_err:
+                            st.error(f"Rejected: {url[:60]} — {cap_err}")
+                            continue
                         add_paper(docs, active_sid)
                         st.success(f"Loaded: {url[:60]}")
                     except Exception as e:
@@ -323,14 +369,25 @@ with st.sidebar:
         label_visibility="collapsed",
         placeholder="1706.03762  or  Attention Is All You Need",
     )
-    if st.button("Load ArXiv Paper", use_container_width=True, key="btn_load_arxiv"):
+    if st.button(
+        "Load ArXiv Paper",
+        use_container_width=True,
+        key="btn_load_arxiv",
+        disabled=OFFLINE,
+    ):
         if arxiv_title.strip():
             with st.spinner("Loading from ArXiv…"):
                 try:
                     docs = load_arxiv(arxiv_title.strip())
-                    add_paper(docs, active_sid)
-                    loaded_title = docs[0].metadata.get("title") if docs else arxiv_title.strip()
-                    st.success(f"Loaded: {loaded_title}")
+                    cap_err = _enforce_ingest_caps(len(docs))
+                    if cap_err:
+                        st.error(f"Rejected: {arxiv_title.strip()} — {cap_err}")
+                    else:
+                        add_paper(docs, active_sid)
+                        loaded_title = (
+                            docs[0].metadata.get("title") if docs else arxiv_title.strip()
+                        )
+                        st.success(f"Loaded: {loaded_title}")
                 except Exception as e:
                     st.error(f"Failed: {e}")
             st.rerun()
@@ -361,7 +418,9 @@ st.markdown(
     "> Upload documents in the sidebar and start chatting below."
 )
 
-if demo_guard.is_demo_mode():
+if OFFLINE:
+    st.error(demo_guard.offline_message())
+elif demo_guard.is_demo_mode():
     cap = demo_guard.session_message_cap()
     email = demo_guard.contact_email()
     contact = f" — email **{email}** for full access" if email else ""
@@ -381,7 +440,12 @@ for msg in st.session_state.chats.get(active_sid, []):
                 st.json(msg["graph_state"])
 
 # ── Chat input ─────────────────────────────────────────────────────────────────
-if prompt := st.chat_input("Ask about your papers, verify a claim, or search the web…"):
+_chat_placeholder = (
+    "🚫 AI disabled by maintainer — browse-only mode"
+    if OFFLINE
+    else "Ask about your papers, verify a claim, or search the web…"
+)
+if prompt := st.chat_input(_chat_placeholder, disabled=OFFLINE):
     is_btw = prompt.strip().lower().startswith("/btw")
 
     if is_btw:
@@ -415,9 +479,11 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             st.markdown(prompt)
         st.session_state.chats[active_sid].append({"role": "user", "content": prompt})
 
-        # ── Demo-mode gates: refuse to invoke the graph if we're over cap or the LLM is down.
+        # ── Gates: refuse to invoke the graph if offline, over cap, or LLM down.
         blocked_reason: str | None = None
-        if demo_guard.over_ip_cap():
+        if OFFLINE:
+            blocked_reason = demo_guard.offline_message()
+        elif demo_guard.over_ip_cap():
             blocked_reason = (
                 f"You've reached today's {demo_guard.ip_cap()}-message limit for your network. "
                 f"Please try again tomorrow or {demo_guard.cta_message()}."
@@ -434,19 +500,20 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
             )
         elif demo_guard.llm_status() == "unhealthy":
             blocked_reason = (
-                "The model is currently unavailable. "
-                f"Please {demo_guard.cta_message()}."
+                f"The model is currently unavailable. Please {demo_guard.cta_message()}."
             )
 
         if blocked_reason is not None:
             with st.chat_message("assistant"):
                 st.warning(blocked_reason)
-            st.session_state.chats[active_sid].append({
-                "role": "assistant",
-                "content": blocked_reason,
-                "graph_state": {"blocked": True},
-                "turn": st.session_state.turns[active_sid],
-            })
+            st.session_state.chats[active_sid].append(
+                {
+                    "role": "assistant",
+                    "content": blocked_reason,
+                    "graph_state": {"blocked": True},
+                    "turn": st.session_state.turns[active_sid],
+                }
+            )
             st.stop()
 
         if is_first_message:
@@ -491,12 +558,16 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
                         and hasattr(chunk, "content")
                         and chunk.content
                     ):
-                        response_text += chunk.content
-                        placeholder.markdown(response_text + "▌")
+                        chunk_text = content_to_text(chunk.content)
+                        if chunk_text:
+                            response_text += chunk_text
+                            placeholder.markdown(response_text + "▌")
 
                 if not response_text:
                     final_values = graph.get_state(config).values
-                    response_text = final_values.get("answer") or "No response generated."
+                    response_text = (
+                        content_to_text(final_values.get("answer")) or "No response generated."
+                    )
 
                 placeholder.markdown(response_text)
 
@@ -525,8 +596,7 @@ if prompt := st.chat_input("Ask about your papers, verify a claim, or search the
                 else:
                     demo_guard.mark_llm_unhealthy(str(e))
                     error_text = (
-                        "The model is currently unavailable. "
-                        f"Please {demo_guard.cta_message()}."
+                        f"The model is currently unavailable. Please {demo_guard.cta_message()}."
                     )
                 placeholder.empty()
                 st.error(error_text)

@@ -44,17 +44,51 @@ def get_llm(temperature: float = 0.0) -> BaseChatModel:
     raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}")
 
 
+class _PerQueryEmbeddings(Embeddings):
+    """Adapter that fans embed_documents out to per-query calls.
+
+    Workaround for langchain-google-genai 4.2.3, whose batched
+    embed_documents against gemini-embedding-2 returns 1 result regardless
+    of input count, breaking QdrantVectorStore ingestion. embed_query works
+    correctly, so we just call it per chunk. Slower on cold ingest, but the
+    CacheBackedEmbeddings layer in vector_store.py memoises per-text.
+    """
+
+    def __init__(self, inner: Embeddings):
+        self._inner = inner
+        # Surface the wrapped model name so caching/namespacing keeps working.
+        self.model = getattr(inner, "model", inner.__class__.__name__)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._inner.embed_query(text)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._inner.embed_query(t) for t in texts]
+
+
 def get_embeddings() -> Embeddings:
     provider = _provider("EMBED_PROVIDER", "gemini")
 
     if provider == "gemini":
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-        return GoogleGenerativeAIEmbeddings(
-            model=os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001"),
-            google_api_key=os.environ["GEMINI_API_KEY"],
-            task_type="retrieval_document",
-        )
+        # Native output is 3072 dims; honour GEMINI_EMBED_DIM so embeddings
+        # match the Qdrant collection size (recommended: 768, 1536, 3072).
+        # gemini-embedding-2 doesn't use task_type (the task instruction is
+        # baked into the prompt text instead); only pass it for -001.
+        model = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-2")
+        kwargs: dict = {
+            "model": model,
+            "google_api_key": os.environ["GEMINI_API_KEY"],
+            "output_dimensionality": int(os.getenv("GEMINI_EMBED_DIM", "768")),
+        }
+        if model.startswith("gemini-embedding-001"):
+            kwargs["task_type"] = "retrieval_document"
+        inner = GoogleGenerativeAIEmbeddings(**kwargs)
+        # Wrap to fix batched embed_documents (broken for -2 in this version).
+        if model.startswith("gemini-embedding-2"):
+            return _PerQueryEmbeddings(inner)
+        return inner
 
     if provider == "openai":
         from langchain_openai import OpenAIEmbeddings
@@ -77,6 +111,27 @@ def get_embed_dim() -> int:
         return int(os.getenv("OPENAI_EMBED_DIM", "1536"))
 
     raise ValueError(f"Unknown EMBED_PROVIDER: {provider!r}")
+
+
+def content_to_text(content) -> str:
+    """Normalise LangChain message content (str | list[dict|str]) to a plain string.
+
+    Gemini returns answers as a list of content blocks
+    (`[{'type': 'text', 'text': '...'}, ...]`); OpenAI returns strings. We
+    flatten blocks to text and drop non-text parts (images, etc.).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content) if content is not None else ""
 
 
 def llm_provider_label() -> str:

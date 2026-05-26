@@ -20,11 +20,10 @@ EMBEDDING_DIM = get_embed_dim()
 
 base_embeddings = get_embeddings()
 # Namespace the cache so switching providers/models doesn't return stale vectors.
-_cache_namespace = (
-    getattr(base_embeddings, "model", None)
-    or type(base_embeddings).__name__
-)
-embedding_file_store = LocalFileStore("./embedding_cache/")
+_cache_namespace = getattr(base_embeddings, "model", None) or type(base_embeddings).__name__
+_cache_dir = os.getenv("ATELIER_EMBEDDING_CACHE_DIR", ".data/embedding_cache/")
+os.makedirs(_cache_dir, exist_ok=True)
+embedding_file_store = LocalFileStore(_cache_dir)
 embeddings = CacheBackedEmbeddings.from_bytes_store(
     base_embeddings,
     embedding_file_store,
@@ -41,6 +40,7 @@ qdrant_client = QdrantClient(
 
 
 # ── Collection ───────────────────────────────────────────────────────────────
+
 
 def get_collection_name(session_id: str) -> str:
     return f"atelier_{session_id.replace('-', '_')}"
@@ -61,6 +61,7 @@ def get_vectorstore(session_id: str) -> QdrantVectorStore:
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
+
 
 def add_paper(docs: list[Document], session_id: str) -> None:
     get_vectorstore(session_id).add_documents(docs)

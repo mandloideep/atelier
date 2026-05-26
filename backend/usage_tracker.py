@@ -16,7 +16,7 @@ _CONN: sqlite3.Connection | None = None
 
 
 def _db_path() -> Path:
-    checkpoints = os.getenv("ATELIER_CHECKPOINTS_DB", "checkpoints.db")
+    checkpoints = os.getenv("ATELIER_CHECKPOINTS_DB", ".data/checkpoints/checkpoints.db")
     return Path(checkpoints).parent / "usage.db"
 
 
@@ -64,10 +64,14 @@ def daily_count(ip: str) -> int:
     if not ip:
         return 0
     with _LOCK:
-        row = _conn().execute(
-            "SELECT count FROM usage WHERE ip = ? AND day = ?",
-            (ip, _today()),
-        ).fetchone()
+        row = (
+            _conn()
+            .execute(
+                "SELECT count FROM usage WHERE ip = ? AND day = ?",
+                (ip, _today()),
+            )
+            .fetchone()
+        )
     return int(row[0]) if row else 0
 
 
@@ -110,10 +114,14 @@ def eval_daily_count(ip: str) -> int:
     if not ip:
         return 0
     with _LOCK:
-        row = _conn().execute(
-            "SELECT count FROM eval_usage WHERE ip = ? AND day = ?",
-            (ip, _today()),
-        ).fetchone()
+        row = (
+            _conn()
+            .execute(
+                "SELECT count FROM eval_usage WHERE ip = ? AND day = ?",
+                (ip, _today()),
+            )
+            .fetchone()
+        )
     return int(row[0]) if row else 0
 
 

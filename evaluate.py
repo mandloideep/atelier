@@ -6,9 +6,6 @@ from uuid import uuid4
 sys.stdout.reconfigure(encoding="utf-8")
 sys.stderr.reconfigure(encoding="utf-8")
 
-from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage
-
 from deepeval import evaluate
 from deepeval.evaluate import AsyncConfig
 from deepeval.metrics import (
@@ -21,6 +18,8 @@ from deepeval.metrics import (
 from deepeval.synthesizer import Synthesizer
 from deepeval.synthesizer.config import ContextConstructionConfig
 from deepeval.test_case import LLMTestCase
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
 
 from backend.paper_loader import load_document
 from backend.rag_graph import build_graph
@@ -28,11 +27,14 @@ from backend.vector_store import add_paper
 
 load_dotenv()
 
-PDF_PATH            = "documents/Openclaw_Research_Report.pdf"
-GOLDENS_FILE        = Path("goldens.json")
-MAX_CONTEXTS        = 5
+PDF_PATH = "documents/Openclaw_Research_Report.pdf"
+ARTIFACTS_DIR = Path("artifacts")
+GOLDENS_FILE = ARTIFACTS_DIR / "goldens.json"
+RESULTS_FILE = ARTIFACTS_DIR / "eval_results.json"
+EVAL_CHECKPOINTS_DB = ".data/checkpoints/eval_checkpoints.db"
+MAX_CONTEXTS = 5
 GOLDENS_PER_CONTEXT = 2
-METRIC_THRESHOLD    = 0.7
+METRIC_THRESHOLD = 0.7
 
 
 def generate_goldens() -> list[dict]:
@@ -50,6 +52,7 @@ def generate_goldens() -> list[dict]:
         for g in goldens
         if g.input and g.expected_output
     ]
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     GOLDENS_FILE.write_text(json.dumps(pairs, indent=2, ensure_ascii=False), encoding="utf-8")
     return pairs
 
@@ -80,7 +83,7 @@ def main() -> None:
     pairs = load_goldens() if GOLDENS_FILE.exists() else generate_goldens()
 
     docs = load_document(PDF_PATH)
-    graph = build_graph(db_path="eval_checkpoints.db")
+    graph = build_graph(db_path=EVAL_CHECKPOINTS_DB)
 
     metrics = [
         ContextualPrecisionMetric(threshold=METRIC_THRESHOLD, model="gpt-5.4-mini"),
@@ -114,24 +117,26 @@ def main() -> None:
 
     summary = []
     for test_result in results.test_results:
-        summary.append({
-            "input": test_result.input,
-            "actual_output": test_result.actual_output,
-            "success": test_result.success,
-            "metrics": [
-                {
-                    "name": m.name,
-                    "score": m.score,
-                    "passed": m.success,
-                    "reason": m.reason,
-                }
-                for m in test_result.metrics_data
-            ],
-        })
+        summary.append(
+            {
+                "input": test_result.input,
+                "actual_output": test_result.actual_output,
+                "success": test_result.success,
+                "metrics": [
+                    {
+                        "name": m.name,
+                        "score": m.score,
+                        "passed": m.success,
+                        "reason": m.reason,
+                    }
+                    for m in test_result.metrics_data
+                ],
+            }
+        )
 
-    results_path = Path("eval_results.json")
-    results_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nResults saved to {results_path}.")
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_FILE.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"\nResults saved to {RESULTS_FILE}.")
 
 
 if __name__ == "__main__":

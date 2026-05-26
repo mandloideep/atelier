@@ -1,9 +1,8 @@
-"""In-memory per-session transcript of graph node events.
+"""Per-session transcript of graph node events.
 
-Captures router decisions, retrieval results, tool calls, claim verdicts, and
-final answers so the Transcript page can render a human-readable timeline of
-what the agent did. No persistence — survives container restart is explicitly
-not a goal; the LangGraph checkpointer holds the durable state.
+In-memory hot cache (capped/evicted) sits in front of a SQLite write-through.
+The Transcript page reads from memory first; if empty (post-restart or after
+LRU eviction), it falls back to SQLite via `persistence.read_transcript`.
 
 Eviction is bounded by three knobs (env-tunable):
 
@@ -26,14 +25,23 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import psutil
 
+from backend import persistence
+
 EventKind = Literal[
-    "router", "retrieval", "tool_call", "tool_result",
-    "verdict", "answer", "rewrite", "relevancy", "error",
+    "router",
+    "retrieval",
+    "tool_call",
+    "tool_result",
+    "verdict",
+    "answer",
+    "rewrite",
+    "relevancy",
+    "error",
 ]
 
 
@@ -61,7 +69,7 @@ def _cgroup_memory_limit_bytes() -> int | None:
             if value > 1 << 60:
                 return None
             return value
-        except (FileNotFoundError, PermissionError, ValueError):
+        except FileNotFoundError, PermissionError, ValueError:
             continue
     return None
 
@@ -88,7 +96,7 @@ class TranscriptStore:
         if not _is_enabled() or not session_id:
             return
         event = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "kind": kind,
             "summary": summary,
             "node": node,
@@ -105,15 +113,23 @@ class TranscriptStore:
             events.append(event)
             self._last_touched[session_id] = time.time()
             self._evict_locked(len(events))
+        # Write-through to SQLite for durability. Best-effort, never blocks.
+        persistence.write_transcript_event(session_id, event)
 
     def get(self, session_id: str) -> list[dict[str, Any]]:
+        """In-memory events first; falls back to SQLite if memory is empty
+        (post-restart or LRU-evicted)."""
         with self._lock:
-            return list(self._sessions.get(session_id, []))
+            in_mem = list(self._sessions.get(session_id, []))
+        if in_mem:
+            return in_mem
+        return persistence.read_transcript(session_id)
 
     def clear(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
             self._last_touched.pop(session_id, None)
+        persistence.clear_transcript(session_id)
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

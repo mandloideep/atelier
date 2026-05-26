@@ -17,7 +17,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 from tavily import TavilyClient
 
-from backend.llm_factory import get_llm
+from backend.llm_factory import content_to_text, get_llm
 from backend.models import ClaimVerificationResult, RelevancyDecision, RouterDecision
 from backend.transcript import store as transcript_store
 from backend.vector_store import search as vs_search
@@ -28,6 +28,7 @@ llm = get_llm()
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
+
 
 class RAGState(MessagesState):
     session_id: str
@@ -45,29 +46,31 @@ class RAGState(MessagesState):
 
 # ── Router ────────────────────────────────────────────────────────────────────
 
-ROUTER_PROMPT = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        "You are a routing assistant for a research paper Q&A system. "
-        "Classify the user query into exactly one of three categories:\n\n"
-        "  retrieve — Use this for TWO types of questions:\n"
-        "    (a) Questions about the content of uploaded research papers "
-        "(e.g. methods, results, conclusions, authors).\n"
-        "    (b) Questions that require live or current information that cannot be "
-        "answered from general knowledge alone — such as current events, today's weather, "
-        "live prices, recent news, or anything where the answer changes over time "
-        "(e.g. 'Who is the current president?', 'What is the price of gold today?', "
-        "'What is the weather in Delhi?').\n"
-        "  verify_claim — The user wants to check whether a specific claim or finding "
-        "from a paper is still accurate or has been superseded.\n"
-        "  direct_answer — A stable general knowledge question answerable from training data "
-        "with no retrieval needed (e.g. 'What is softmax?', 'Who invented the transformer?', "
-        "'Explain backpropagation.').\n\n"
-        "When in doubt between retrieve and direct_answer, prefer retrieve.\n\n"
-        "Return only the route field.",
-    ),
-    ("human", "{query}"),
-])
+ROUTER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a routing assistant for a research paper Q&A system. "
+            "Classify the user query into exactly one of three categories:\n\n"
+            "  retrieve — Use this for TWO types of questions:\n"
+            "    (a) Questions about the content of uploaded research papers "
+            "(e.g. methods, results, conclusions, authors).\n"
+            "    (b) Questions that require live or current information that cannot be "
+            "answered from general knowledge alone — such as current events, today's weather, "
+            "live prices, recent news, or anything where the answer changes over time "
+            "(e.g. 'Who is the current president?', 'What is the price of gold today?', "
+            "'What is the weather in Delhi?').\n"
+            "  verify_claim — The user wants to check whether a specific claim or finding "
+            "from a paper is still accurate or has been superseded.\n"
+            "  direct_answer — A stable general knowledge question answerable from training data "
+            "with no retrieval needed (e.g. 'What is softmax?', 'Who invented the transformer?', "
+            "'Explain backpropagation.').\n\n"
+            "When in doubt between retrieve and direct_answer, prefer retrieve.\n\n"
+            "Return only the route field.",
+        ),
+        ("human", "{query}"),
+    ]
+)
 
 router_chain = ROUTER_PROMPT | llm.with_structured_output(RouterDecision)
 
@@ -87,6 +90,7 @@ def router_node(state: RAGState) -> dict:
 
 # ── Tool schemas ──────────────────────────────────────────────────────────────
 
+
 class RetrieverInput(BaseModel):
     query: str = Field(description="Semantic query to search research paper chunks")
     k: int = Field(default=4, ge=1, le=10, description="Number of chunks to retrieve")
@@ -98,6 +102,7 @@ class WebSearchInput(BaseModel):
 
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
+
 
 @tool(args_schema=RetrieverInput)
 def retrieve_from_vectorstore(
@@ -123,7 +128,12 @@ def retrieve_from_vectorstore(
         },
     )
     if not docs:
-        return [ToolMessage(content="No relevant documents found in the vector store.", tool_call_id=tool_call_id)]
+        return [
+            ToolMessage(
+                content="No relevant documents found in the vector store.",
+                tool_call_id=tool_call_id,
+            )
+        ]
     summary = f"Retrieved {len(docs)} chunk(s) from the vector store."
     return [
         ToolMessage(content=summary, tool_call_id=tool_call_id),
@@ -174,7 +184,12 @@ def web_search(
 # ── Retrieval agent singletons ────────────────────────────────────────────────
 
 RETRIEVAL_TOOLS = [retrieve_from_vectorstore, web_search]
-retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, parallel_tool_calls=False)
+# `parallel_tool_calls` is an OpenAI-only kwarg; Gemini's GenerateContentConfig
+# rejects unknown fields and raises ValidationError if we pass it through.
+_bind_kwargs: dict = {}
+if (os.getenv("LLM_PROVIDER") or "gemini").strip().lower() == "openai":
+    _bind_kwargs["parallel_tool_calls"] = False
+retrieval_llm = llm.bind_tools(RETRIEVAL_TOOLS, **_bind_kwargs)
 base_tool_node = ToolNode(RETRIEVAL_TOOLS)
 
 RETRIEVE_SYSTEM = (
@@ -219,6 +234,7 @@ QUERY_REWRITE_SYSTEM = (
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
+
 
 def agent_node(state: RAGState) -> dict:
     current_attempts = state.get("retrieval_attempts", 0)
@@ -278,10 +294,12 @@ def relevancy_check_node(state: RAGState) -> dict:
         f"Question: {query}\n\nRetrieved chunks:\n{doc_snippets}\n\n"
         "Are these chunks relevant to answering the question?"
     )
-    decision: RelevancyDecision = relevancy_llm.invoke([
-        {"role": "system", "content": RELEVANCY_CHECK_SYSTEM},
-        {"role": "user", "content": prompt},
-    ])
+    decision: RelevancyDecision = relevancy_llm.invoke(
+        [
+            {"role": "system", "content": RELEVANCY_CHECK_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
+    )
     transcript_store.append(
         state.get("session_id", ""),
         kind="relevancy",
@@ -295,11 +313,16 @@ def relevancy_check_node(state: RAGState) -> dict:
 def query_rewrite_node(state: RAGState) -> dict:
     original_query = state["query"]
     rewrite_count = state.get("rewrite_count", 0)
-    response = llm.invoke([
-        {"role": "system", "content": QUERY_REWRITE_SYSTEM},
-        {"role": "user", "content": f"Original query: {original_query}\n\nWrite an improved search query."},
-    ])
-    rewritten = response.content.strip()
+    response = llm.invoke(
+        [
+            {"role": "system", "content": QUERY_REWRITE_SYSTEM},
+            {
+                "role": "user",
+                "content": f"Original query: {original_query}\n\nWrite an improved search query.",
+            },
+        ]
+    )
+    rewritten = content_to_text(response.content).strip()
     transcript_store.append(
         state.get("session_id", ""),
         kind="rewrite",
@@ -353,29 +376,19 @@ def verify_claim_node(state: RAGState) -> dict:
     lines = ["=== General Web Search Results ==="]
     for r in general_results:
         lines.append(
-            f"Title: {r.get('title', '')}\n"
-            f"URL: {r['url']}\n"
-            f"Snippet: {r.get('content', '')[:300]}\n"
+            f"Title: {r.get('title', '')}\nURL: {r['url']}\nSnippet: {r.get('content', '')[:300]}\n"
         )
 
     lines.append("=== arXiv Paper Search Results ===")
     for r in arxiv_results:
         lines.append(
-            f"Title: {r.get('title', '')}\n"
-            f"URL: {r['url']}\n"
-            f"Snippet: {r.get('content', '')[:300]}\n"
+            f"Title: {r.get('title', '')}\nURL: {r['url']}\nSnippet: {r.get('content', '')[:300]}\n"
         )
 
     context = "\n".join(lines)
 
-    prompt = (
-        f"{CLAIM_ANALYSIS_PROMPT}\n\n"
-        f"Claim to verify:\n{claim}\n\n"
-        f"Search Results:\n{context}"
-    )
-    result: ClaimVerificationResult = verification_llm.invoke([
-        {"role": "user", "content": prompt}
-    ])
+    prompt = f"{CLAIM_ANALYSIS_PROMPT}\n\nClaim to verify:\n{claim}\n\nSearch Results:\n{context}"
+    result: ClaimVerificationResult = verification_llm.invoke([{"role": "user", "content": prompt}])
 
     papers_dicts = [p.model_dump() for p in result.superseding_papers[:3]]
     transcript_store.append(
@@ -401,6 +414,17 @@ def generate_answer_node(state: RAGState) -> dict:
     query = state["query"]
 
     if route == "retrieve":
+        # Reuse the agent's direct answer if it produced one without calling
+        # a tool (common when chat history already contains the context).
+        last = state["messages"][-1] if state.get("messages") else None
+        agent_answer = ""
+        if (
+            last is not None
+            and type(last).__name__ in ("AIMessage", "AIMessageChunk")
+            and not getattr(last, "tool_calls", None)
+        ):
+            agent_answer = content_to_text(getattr(last, "content", "") or "").strip()
+
         if state.get("is_relevant") is False and state.get("rewrite_count", 0) >= 1:
             answer = (
                 "I wasn't able to find relevant information in the uploaded papers "
@@ -410,11 +434,13 @@ def generate_answer_node(state: RAGState) -> dict:
         else:
             docs = state.get("retrieved_docs") or []
             if not docs:
-                answer = "I don't know the answer."
+                answer = agent_answer or "I don't know the answer."
             else:
                 context = "\n\n---\n\n".join(doc.page_content for doc in docs)
-                prompt = f"Answer the question using this context:\n\n{context}\n\nQuestion: {query}"
-                answer = llm.invoke([{"role": "user", "content": prompt}]).content
+                prompt = (
+                    f"Answer the question using this context:\n\n{context}\n\nQuestion: {query}"
+                )
+                answer = content_to_text(llm.invoke([{"role": "user", "content": prompt}]).content)
 
     elif route == "verify_claim":
         verdict = state.get("claim_verdict", "")
@@ -444,7 +470,7 @@ def generate_answer_node(state: RAGState) -> dict:
 
     else:  # direct_answer
         prompt = f"Answer from your knowledge.\n\nQuestion: {query}"
-        answer = llm.invoke([{"role": "user", "content": prompt}]).content
+        answer = content_to_text(llm.invoke([{"role": "user", "content": prompt}]).content)
 
     transcript_store.append(
         state.get("session_id", ""),
@@ -474,6 +500,14 @@ def agent_routing(state: RAGState) -> str:
         return "retrieval"
     if state.get("retrieval_attempts", 0) >= MAX_RETRIEVAL_ATTEMPTS:
         return "generate_answer"
+    # If the agent answered directly without calling a tool (e.g. Gemini
+    # decided it already had enough context from chat history), use that
+    # answer rather than looping through relevancy/rewrite with empty docs.
+    last = state["messages"][-1] if state.get("messages") else None
+    if last is not None and not getattr(last, "tool_calls", None):
+        text = content_to_text(getattr(last, "content", "") or "")
+        if text.strip():
+            return "generate_answer"
     return "relevancy_check"
 
 
@@ -487,7 +521,7 @@ def after_relevancy_routing(state: RAGState) -> str:
 
 def build_graph(db_path: str | None = None):
     if db_path is None:
-        db_path = os.getenv("ATELIER_CHECKPOINTS_DB", "checkpoints.db")
+        db_path = os.getenv("ATELIER_CHECKPOINTS_DB", ".data/checkpoints/checkpoints.db")
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False)
     checkpointer = SqliteSaver(conn)
@@ -535,4 +569,3 @@ def build_graph(db_path: str | None = None):
     graph.add_edge("generate_answer", END)
 
     return graph.compile(checkpointer=checkpointer)
-
