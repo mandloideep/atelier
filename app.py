@@ -8,7 +8,7 @@ from pathlib import Path
 import streamlit as st
 from langchain_core.messages import HumanMessage
 
-from backend import demo_guard
+from backend import demo_guard, keep_alive
 from backend.btw_handler import handle_btw
 from backend.llm_factory import content_to_text, get_llm, llm_provider_label
 from backend.paper_loader import load_arxiv, load_document, load_webpage
@@ -22,6 +22,15 @@ st.set_page_config(page_title="Atelier", page_icon="📚", layout="centered")
 @st.cache_resource
 def get_graph():
     return build_graph()
+
+
+@st.cache_resource
+def _start_keep_alive() -> bool:
+    keep_alive.start()
+    return True
+
+
+_start_keep_alive()
 
 
 SESSIONS_FILE = Path(os.getenv("ATELIER_SESSIONS_FILE", ".data/state/sessions.json"))
